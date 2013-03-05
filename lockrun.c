@@ -1,5 +1,82 @@
 /*
- * See README.markdown for build, install, and usage instructions.
+ * $Id: //websites/unixwiz/unixwiz.net/webroot/tools/lockrun.c#6 $
+ *
+ * written by :	Stephen J. Friedl
+ *              Software Consultant
+ *		Southern California USA
+ *              steve@unixwiz.net
+ *		http://www.unixwiz.net/tools/
+ *
+ *	===================================================================
+ *	======== This software is in the public domain, and can be ========
+ *	======== used by anybody for any purpose                   ========
+ *	===================================================================
+ *
+ *	Lockrun: This program is used to launch a program out with a lockout
+ *	so that only one can run at a time. It's mainly intended for use out
+ *	of cron so that our five-minute running jobs which run long don't get
+ *	walked on. We find this a *lot* with Cacti jobs which just get hung
+ *	up: it's better to miss a polling period than to stack them up and
+ *	slow each other down.
+ *
+ *	So we use a file which is used for locking: this program attempts to
+ *	lock the file, and if the lock exists, we have to either exit with
+ *	an error, or wait for it to release.
+ *
+ *		lockrun --lockfile=FILE -- my command here
+ *
+ * COMMAND LINE
+ * ------------
+ *
+ * --lockfile=F
+ *
+ *	Specify the name of a file which is used for locking. The file is
+ *	created if necessary (with mode 0666), and no I/O of any kind is
+ *	done. The file is never removed.
+ *
+ * --maxtime=N
+ *
+ *	The script being controlled should run for no more than <N> seconds,
+ *	and if it's beyond that time, we should report it to the standard
+ *	error (which probably gets routed to the user via cron's email).
+ *
+ * --wait
+ *
+ *	When a lock is hit, we normally exit with error, but --wait causes
+ *	it to loop until the lock is released.
+ *
+ * --sleep=N
+ * 
+ *	When using --wait, will sleep <N> seconds between attempts to acquire
+ *	the lock.
+ *
+ * --retries=N
+ *
+ *	When using --wait, will try only <N> attempts of acquiring the lock.
+ * 
+ * --verbose
+ *
+ *	Show a bit more runtime debugging.
+ *
+ * --quiet
+ *
+ *	Don't show "run is locked" error if things are busy; keeps cron from
+ *	overwhelming you with messages if lockrun overlap is not uncommon.
+ *
+ * --
+ *
+ *	Mark the end of the options: the command to run follows.
+ *	
+ *
+ * VERSION HISTORY
+ *
+ * 1.1.1 2012/09/05; added setsid() to make the controlled process a process
+ *			group leader
+ * 1.1.0 2012/09/05; added --version and --help; added --retries (thanks Dov Murik)
+ * 1.0.3 2010/11/20; added --quiet parameter
+ * 1.0.2 2009/06/25; added lockf() support for Solaris 10 (thanks Michal Bella)
+ * 1.0.1 2006/06/03; initial release	
+ * 
  */
 
 #include <stdio.h>
@@ -13,6 +90,8 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/file.h>
+
+static const char Version[] = "lockrun 1.1.1 - 2012-09-05 - steve@unixwiz.net";
 
 #ifndef __GNUC__
 # define __attribute__(x)	/* nothing */
@@ -30,9 +109,10 @@ static const char	*lockfile = 0;
 static int		wait_for_lock = FALSE;
 static mode_t		openmode = 0666;
 static int		sleeptime = 10;		/* seconds */
+static int		retries = 0;
 static int		Verbose = FALSE;
 static int		Maxtime  = 0;
-static int		idempotent = FALSE;
+static int		Quiet = FALSE;
 
 static char *getarg(char *opt, char ***pargv);
 
@@ -46,6 +126,33 @@ static void die(const char *format, ...)
 # define WAIT_AND_LOCK(fd) flock(fd, LOCK_EX | LOCK_NB)
 #endif
 
+static const char *const helptext[] = {
+	"Usage: lockrun [options] -- command args...",
+	"",
+	"  --help        Show this brief help listing",
+	"  --version     Report the version info",
+	"  --            Mark the end of lockrun options; command follows",
+	"  --verbose     Show a bit more runtime debugging",
+	"    -V",
+	"  --quiet       Exit quietly (and with success) if locked",
+	"    -q",
+	"  --lockfile=F  Specify lockfile as file <F>",
+	"    -L=F",
+	"  --wait        Wait for lockfile to appear (else exit on lock)",
+	"    -W",
+	"",
+	" Options with --wait:",
+	"",
+	"  --sleep=T     Sleep for <T> seconds on each wait loop",
+	"    -S=T",
+	"  --retries=N   Attempt <N> retries in each wait loop",
+	"    -R=N",
+	"  --maxtime=T   Wait for at most <T> seconds for a lock, then exit",
+	0,
+};
+
+static void show_help(const char *const *);
+
 int main(int argc, char **argv)
 {
 	char	*Argv0 = *argv;
@@ -53,6 +160,7 @@ int main(int argc, char **argv)
 	int	lfd;
 	pid_t	childpid;
 	time_t	starttime;
+	int	attempts = 0;
 
 	UNUSED_PARAMETER(argc);
 
@@ -73,7 +181,19 @@ int main(int argc, char **argv)
 
 		if (opt) *opt++ = '\0'; /* pick off the =VALUE part */
 
-		if ( STRMATCH(arg, "-L") || STRMATCH(arg, "--lockfile"))
+		if ( STRMATCH(arg, "--version") )
+		{
+			puts(Version);
+			exit(EXIT_SUCCESS);
+		}
+
+		else if ( STRMATCH(arg, "--help"))
+		{
+			show_help(helptext);
+			exit(EXIT_SUCCESS);
+		}
+
+		else if ( STRMATCH(arg, "-L") || STRMATCH(arg, "--lockfile"))
 		{
 			lockfile = getarg(opt, &argv);
 		}
@@ -88,6 +208,11 @@ int main(int argc, char **argv)
 			sleeptime = atoi(getarg(opt, &argv));
 		}
 
+		else if ( STRMATCH(arg, "-R") || STRMATCH(arg, "--retries"))
+		{
+			retries = atoi(getarg(opt, &argv));
+		}
+
 		else if ( STRMATCH(arg, "-T") || STRMATCH(arg, "--maxtime"))
 		{
 			Maxtime = atoi(getarg(opt, &argv));
@@ -97,10 +222,10 @@ int main(int argc, char **argv)
 		{
 			Verbose++;
 		}
-		
-		else if ( STRMATCH(arg, "-I") || STRMATCH(arg, "--idempotent"))
+
+		else if ( STRMATCH(arg, "-q") || STRMATCH(arg, "--quiet"))
 		{
-			idempotent = TRUE;
+			Quiet = TRUE;
 		}
 
 		else
@@ -134,21 +259,23 @@ int main(int argc, char **argv)
 
 	while ( WAIT_AND_LOCK(lfd) != 0 )
 	{
+		attempts++;
+
 		if ( ! wait_for_lock )
 		{
-			
-			if(idempotent) /* given the idempotent flag, we treat contention as a no-op */
-			{
+			if ( Quiet)
 				exit(EXIT_SUCCESS);
-			}
 			else
-			{
 				die("ERROR: cannot launch %s - run is locked", argv[0]);
-			}
+		}
+
+		if ( retries > 0 && attempts >= retries )
+		{
+			die("ERROR: cannot launch %s - run is locked (after %d attempts)", argv[0], attempts);
 		}
 
 		/* waiting */
-		if ( Verbose ) printf("(locked: sleeping %d secs)\n", sleeptime);
+ 		if ( Verbose ) printf("(locked: sleeping %d secs, after attempt #%d)\n", sleeptime, attempts);
 
 		sleep(sleeptime);
 	}
@@ -160,12 +287,27 @@ int main(int argc, char **argv)
 
 	if ( (childpid = fork()) == 0 )
 	{
-		close(lfd);		// don't need the lock file
+		/* IN THE CHILD */
+
+		close(lfd);		/* don't need the lock file */
+
+		/* Make ourselves a process group leader so that this and all
+		 * child processes can be sent a signal as a group. This may
+		 * be used someday to support a --kill option, though this is
+		 * is still tricky.
+		 *
+		 * PORTING NOTE: if "setsid" is undefined on your platform,
+		 * just comment it out and send me an email with info about
+		 * the build environment.
+		 */
+		(void) setsid();
 
 		execvp(argv[0], argv);
 	}
 	else if ( childpid > 0 )
 	{
+		/* IN THE PARENT */
+
 		time_t endtime;
 		pid_t  pid;
 		int    status;
@@ -181,8 +323,8 @@ int main(int argc, char **argv)
 		endtime -= starttime;
 
 		if ( Verbose || (Maxtime > 0  &&  endtime > Maxtime) )
-		    printf("pid %d exited with status %d, exit code: %d (time=%ld sec)\n",
-			   pid, status, rc, endtime);
+		    printf("pid %d exited with status %d, exit code: %d (time=%ld sec)\n", 
+         pid, status, rc, endtime);
 	}
 	else
 	{
@@ -242,4 +384,15 @@ va_list	args;
 	va_end(args);
 
 	exit(EXIT_FAILURE);
+}
+
+static void show_help(const char * const *p)
+{
+	puts(Version);
+	puts("");
+
+	for ( ; *p; p++ )
+	{
+		puts(*p);
+	}
 }
